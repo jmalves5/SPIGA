@@ -52,7 +52,6 @@ import torch.multiprocessing as mp
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import wandb
@@ -61,8 +60,6 @@ import wandb
 # ======================== Memory Management ========================
 def setup_memory_optimizations():
     """Enable memory-efficient CUDA settings"""
-    # Allow PyTorch to manage memory more flexibly
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     
     # Enable cuDNN benchmark for faster convolutions (with fixed input sizes)
     torch.backends.cudnn.benchmark = True
@@ -112,7 +109,7 @@ def setup(rank, world_size):
     """Initialize distributed training with NCCL backend.
     
     For SLURM: RANK and WORLD_SIZE come from srun environment.
-    For single GPU: rank=0, world_size=1
+
     """
     # Check if already initialized (important for multi-stage training)
     if dist.is_available() and not dist.is_initialized():
@@ -128,7 +125,9 @@ def setup(rank, world_size):
     elif rank == 0:
         print(f"✓ Process group already initialized (rank {rank}, world_size {world_size})")
     
-    torch.cuda.set_device(rank)
+    # Note: Don't call torch.cuda.set_device() here
+    # It's called after device initialization in main()
+    print(f"[DEBUG] Rank {rank}: setup() returning", flush=True)
 
 def cleanup():
     """Safely destroy distributed process group if initialized."""
@@ -306,45 +305,16 @@ class CombinedLoss(nn.Module):
         return total_loss, losses_detail
 
 
-# ======================== Gradient Monitoring ========================
-def check_for_nan_gradients(model: nn.Module, logger: logging.Logger, batch_idx: int, epoch: int) -> bool:
-    """
-    Check for NaN gradients in model parameters.
-    
-    Args:
-        model: Neural network model
-        logger: Logger instance
-        batch_idx: Current batch index
-        epoch: Current epoch number
-    
-    Returns:
-        True if NaN gradients found, False otherwise
-    """
-    nan_found = False
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            if torch.isnan(param.grad).any():
-                #logger.warning(f"⚠️  NaN gradient detected in parameter '{name}' at epoch {epoch}, batch {batch_idx}")
-                nan_found = True
-            if torch.isinf(param.grad).any():
-                #logger.warning(f"⚠️  Inf gradient detected in parameter '{name}' at epoch {epoch}, batch {batch_idx}")
-                nan_found = True
-    
-    return nan_found
-
-
 # ======================== Training Functions ========================
 def train_epoch(model: nn.Module, 
                 dataloader: DataLoader,
                 criterion: nn.Module,
                 optimizer: optim.Optimizer,
-                scaler: GradScaler,
                 device: torch.device,
                 epoch: int,
                 logger: logging.Logger,
                 rank: int,
                 world_size: int,
-                use_amp: bool = True,
                 wandb_log=None) -> Tuple[float, Dict]:
     """
     Train for one epoch with distributed support
@@ -354,13 +324,11 @@ def train_epoch(model: nn.Module,
         dataloader: Training data loader
         criterion: Loss function
         optimizer: Optimizer
-        scaler: Gradient scaler for AMP
         device: Device to train on
         epoch: Current epoch number
         logger: Logger instance
         rank: Current process rank
         world_size: Total number of processes
-        use_amp: Whether to use Automatic Mixed Precision
 
     Returns:
         avg_loss: Average loss over the epoch
@@ -399,10 +367,8 @@ def train_epoch(model: nn.Module,
             if "headpose" in batch:
                 targets["pose"] = batch["headpose"].to(device, dtype=torch.float32)
 
-            # print loudly batch dict keys and shapes for debugging
-            #print("Batch keys:", batch.keys())
-            #print("Image shape:", images.shape)
-         
+            # Delete batch from memory after moving to device
+            torch.cuda.empty_cache()
 
             # Prepare model inputs
             model3d = None
@@ -420,57 +386,34 @@ def train_epoch(model: nn.Module,
                 while cam_matrix.dim() < 3:
                     cam_matrix = cam_matrix.unsqueeze(0)
 
+            
             optimizer.zero_grad()
 
-            # Forward pass with mixed precision
-            # Model always expects [images, model3d, cam_matrix]
-            # If not provided, create dummy tensors with correct shape
-            if model3d is None:
-                batch_size = images.shape[0]
-                num_landmarks = 98  # SPIGA uses 98 landmarks
-                model3d = torch.zeros(batch_size, num_landmarks, 3, device=device)
-            if cam_matrix is None:
-                batch_size = images.shape[0]
-                # Default camera matrix (identity-like, no scaling)
-                cam_matrix = torch.eye(3, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
-            
-            # Make images have [B, 3, 256, 256]. Currently have [B, 256, 256, 3]
+            # shape images correctly
             if images.shape[1] != 3:
                 images = images.permute(0, 3, 1, 2)
+
+            # Forward pass
+            predictions = model([images, model3d, cam_matrix])
+            loss, loss_details = criterion(predictions, targets)
+
+            # Save loss values before deletion
+            loss_val = loss.item()
+            loss_details_copy = {k: v for k, v in loss_details.items()}
+
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        
+            optimizer.step()
             
-            optimizer.zero_grad()
-
-            # Forward pass with mixed precision
-            if use_amp:
-                with torch.amp.autocast('cuda'):
-                    predictions = model([images, model3d, cam_matrix])
-                    loss, loss_details = criterion(predictions, targets)
-
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients
-                check_for_nan_gradients(model, logger, batch_idx, epoch)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                predictions = model([images, model3d, cam_matrix])
-                loss, loss_details = criterion(predictions, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Check for NaN gradients
-                check_for_nan_gradients(model, logger, batch_idx, epoch)
-                
-                optimizer.step()
-
+            # Aggressive memory cleanup
+            torch.cuda.empty_cache()
+            
             # Accumulate losses
-            total_loss += loss.item()
+            total_loss += loss_val
             num_batches += 1
-            for key, val in loss_details.items():
+            for key, val in loss_details_copy.items():
                 if key not in loss_details_accum:
                     loss_details_accum[key] = 0.0
                 loss_details_accum[key] += val
@@ -479,19 +422,19 @@ def train_epoch(model: nn.Module,
             if is_main_process():
                 if hasattr(pbar, 'set_postfix'):
                     pbar.set_postfix({
-                        'loss': f"{loss.item():.6f}",
+                        'loss': f"{loss_val:.6f}",
                         'avg': f"{total_loss / num_batches:.6f}",
                     })
                 
                 # Log to wandb (main process only)
                 if is_main_process() and wandb_log is not None and batch_idx % 10 == 0:
                     log_dict = {
-                        'train/loss': loss.item(),
+                        'train/loss': loss_val,
                         'train/avg_loss': total_loss / num_batches,
                         'train/batch': batch_idx,
                         'train/epoch': epoch,
                     }
-                    for key, val in loss_details.items():
+                    for key, val in loss_details_copy.items():
                         log_dict[f'train/{key}'] = val
                     wandb_log.log(log_dict)
 
@@ -686,7 +629,7 @@ def load_checkpoint(checkpoint_path: str,
 
 
 def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, world_size: int, wandb_log=None):
-    """Stage 1: Pre-training CNN backbone with landmark detection"""
+    """Stage 1: Pre-training CNN backbone with landmark detection"""    
     if is_main_process():
         logger.info("\n" + "="*80)
         logger.info("STAGE 1: CNN Backbone Pre-training (Landmarks Only)")
@@ -743,7 +686,6 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
     )
     optimizer = optim.Adam(model.parameters(), lr=args.lr_stage1)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage1, gamma=0.1)
-    scaler = torch.amp.GradScaler('cuda')
 
     # Resume from checkpoint if available
     start_epoch = 0
@@ -768,8 +710,8 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, device,
-            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, device,
+            epoch+1, logger, rank, world_size, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -850,7 +792,6 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
     )
     optimizer = optim.Adam(model.parameters(), lr=args.lr_stage2)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage2, gamma=0.1)
-    scaler = GradScaler()
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'stage2')
@@ -862,8 +803,8 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, device,
-            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, device,
+            epoch+1, logger, rank, world_size, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -963,7 +904,6 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
     
     optimizer = optim.Adam(gat_params, lr=args.lr_gat)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_gat, gamma=0.1)
-    scaler = GradScaler()
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'stage3')
@@ -975,8 +915,8 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, device,
-            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, device,
+            epoch+1, logger, rank, world_size, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -1008,21 +948,18 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
     
     return os.path.join(checkpoint_dir, 'best_model.pth')
 
-def main(args):
+def main(rank, args):
     """Main training function for SLURM-based distributed multi-GPU training.
     
-    Rank and world_size are extracted from SLURM environment variables:
-    - RANK: global rank of current process (set by srun)
-    - WORLD_SIZE: total number of processes (set by srun)
-    
-    For single GPU testing, these default to 0 and 1.
+    Rank and world_size are passed as parameters from torchrun launcher.
+    For single GPU testing, rank defaults to 0 and world_size to 4.
     """
     
-    # Extract rank and world_size from SLURM environment or defaults for single GPU
-    rank = int(os.environ.get('RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    local_rank = int(os.environ.get('LOCAL_RANK', rank))
-    
+    # Note: rank and world_size are passed as parameters, not extracted here
+    # This allows torchrun to properly manage the distributed environment
+    world_size = int(os.environ.get('WORLD_SIZE'))
+    local_rank = rank
+
     # Setup memory optimizations (must be before GPU initialization)
     setup_memory_optimizations()
 
@@ -1042,14 +979,6 @@ def main(args):
 
     # Setup logging
     logger = setup_logging(args.log_dir, args.stage, rank)
-    
-    if rank == 0:
-        logger.info(f"Using device: {device}")
-        logger.info(f"Distributed training: rank={rank}, local_rank={local_rank}, world_size={world_size}")
-        if device.type == "cuda":
-            logger.info(f"GPU: {torch.cuda.get_device_name(local_rank)}")
-            logger.info(f"CUDA Version: {torch.version.cuda}")
-            logger.info(f"Total GPUs available: {torch.cuda.device_count()}")
 
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -1070,61 +999,60 @@ def main(args):
         logger.info(f"Training stage: {args.stage}")
         logger.info(f"Batch size per GPU: {args.batch_size}")
         logger.info(f"Total batch size: {args.batch_size * world_size}")
-        logger.info(f"AMP enabled: {args.use_amp}")
         logger.info(f"World size (GPUs): {world_size}")
         logger.info("="*80)
+    
 
-    try:
-        # Run training based on selected stage
-        if args.stage == "all":
-            if rank == 0:
-                logger.info("\nRunning all three training stages sequentially...\n")
-            
-            # Stage 1
-            stage1_path = train_stage1(args, logger, device, rank, world_size, wandb_log=wandb_log)
-            
-            # Barrier to ensure all processes wait
-            if world_size > 1:
-                dist.barrier()
-            
-            # Stage 2
-            stage2_path = train_stage2(args, logger, device, rank, world_size, stage1_path, wandb_log=wandb_log)
-
-            if world_size > 1:
-                dist.barrier()
-            
-            # Stage 3
-            stage3_path = train_stage3(args, logger, device, rank, world_size, stage2_path, wandb_log=wandb_log)
-            
-            if is_main_process():
-                logger.info(f"\nAll stages completed!")
-                logger.info(f"Stage 1 checkpoint: {stage1_path}")
-                logger.info(f"Stage 2 checkpoint: {stage2_path}")
-                logger.info(f"Stage 3 checkpoint: {stage3_path}")
-
-        elif args.stage == "stage1":
-            train_stage1(args, logger, device, rank, world_size, wandb_log=wandb_log)
-
-        elif args.stage == "stage2":
-            pretrained_path = args.resume or os.path.join(args.checkpoint_dir, 'stage1', 'best_model.pth')
-            train_stage2(args, logger, device, rank, world_size, pretrained_path, wandb_log=wandb_log)
-
-        elif args.stage == "stage3":
-            pretrained_path = args.resume or os.path.join(args.checkpoint_dir, 'stage2', 'best_model.pth')
-            train_stage3(args, logger, device, rank, world_size, pretrained_path, wandb_log=wandb_log)
-
-        if is_main_process():
-            logger.info("\n" + "="*80)
-            logger.info("Training complete!")
-            logger.info("="*80)
-
-    finally:
-        # Cleanup wandb
-        if  wandb_log is not None and is_main_process():
-            wandb_log.finish()
+    # Run training based on selected stage
+    if args.stage == "all":
+        if rank == 0:
+            logger.info("\nRunning all three training stages sequentially...\n")
         
-        # Cleanup distributed training
-        cleanup()
+        # Stage 1
+        stage1_path = train_stage1(args, logger, device, rank, world_size, wandb_log=wandb_log)
+        
+        # Barrier to ensure all processes wait
+        if world_size > 1:
+            dist.barrier()
+        
+        # Stage 2
+        stage2_path = train_stage2(args, logger, device, rank, world_size, stage1_path, wandb_log=wandb_log)
+
+        if world_size > 1:
+            dist.barrier()
+        
+        # Stage 3
+        stage3_path = train_stage3(args, logger, device, rank, world_size, stage2_path, wandb_log=wandb_log)
+        
+        if is_main_process():
+            logger.info(f"\nAll stages completed!")
+            logger.info(f"Stage 1 checkpoint: {stage1_path}")
+            logger.info(f"Stage 2 checkpoint: {stage2_path}")
+            logger.info(f"Stage 3 checkpoint: {stage3_path}")
+
+    elif args.stage == "stage1":
+        train_stage1(args, logger, device, rank, world_size, wandb_log=wandb_log)
+
+    elif args.stage == "stage2":
+        pretrained_path = args.resume or os.path.join(args.checkpoint_dir, 'stage1', 'best_model.pth')
+        train_stage2(args, logger, device, rank, world_size, pretrained_path, wandb_log=wandb_log)
+
+    elif args.stage == "stage3":
+        pretrained_path = args.resume or os.path.join(args.checkpoint_dir, 'stage2', 'best_model.pth')
+        train_stage3(args, logger, device, rank, world_size, pretrained_path, wandb_log=wandb_log)
+
+    if is_main_process():
+        logger.info("\n" + "="*80)
+        logger.info("Training complete!")
+        logger.info("="*80)
+
+
+    # Cleanup wandb
+    if  wandb_log is not None and is_main_process():
+        wandb_log.finish()
+    
+    # Cleanup distributed training
+    cleanup()
 
 
 if __name__ == "__main__":
@@ -1205,13 +1133,10 @@ if __name__ == "__main__":
 
     # Training arguments
     parser.add_argument("--batch_size", type=int, default=12,
-                       help="Batch size per GPU (reduced from 24 for 24GB VRAM cards)")
+                       help="Batch size per GPU (very small for large models)")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of data loading workers")
-    parser.add_argument("--use_amp", action="store_true", default=True,
-                       help="Use Automatic Mixed Precision")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
-                       help="Gradient accumulation steps to simulate larger batch size")
+    
     parser.add_argument("--device", type=str, default="cuda",
                        choices=["cuda", "cpu"],
                        help="Device to train on")
@@ -1232,11 +1157,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
-    # For SLURM: rank and world_size come from environment variables set by srun
+    # For SLURM: rank and world_size come from environment variables set by torchrun
     # For single GPU: they default to 0 and 1
-    rank = int(os.environ.get('RANK', 0))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    rank = int(os.environ.get('RANK'))
+    world_size = int(os.environ.get('WORLD_SIZE'))
     
+    print(f"THIS PROCESS IS RANK {rank} BEFORE MAIN")
+
     if rank == 0:
         print(f"✓ SLURM Distributed Training Configuration:")
         print(f"  - Rank: {rank}")
@@ -1246,6 +1173,5 @@ if __name__ == "__main__":
         print(f"  - Master Port: {os.environ.get('MASTER_PORT', '29500')}")
         print()
     
-    # Call main directly (no mp.spawn needed for SLURM)
-    main(args)
-
+    # Call main directly (SLURM + torchrun handles process spawning, NOT mp.spawn)
+    main(rank, args)
