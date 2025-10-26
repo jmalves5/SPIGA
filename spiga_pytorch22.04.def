@@ -18,9 +18,7 @@ From: ubuntu:22.04
     
     # Hugging Face ecosystem
     pip install evaluate transformers accelerate datasets
-    
-    # Install OpenCV headless (no SPIGA installation here!)
-    # UNINSTALL OPENCV
+=
     pip uninstall --yes opencv-python
     pip install opencv-python-headless
     

@@ -130,48 +130,48 @@ class SPIGA(nn.Module):
         embedded_ft = visual_ft + shape_ft
         return embedded_ft
 
-def extract_visual_embedded(self, pts_proj, receptive_field, step):
-    # Must preserve spatial ops in FP32
-    with torch.amp.autocast('cuda', enabled=False):
-        pts_proj = pts_proj.float()
-        receptive_field = receptive_field.float()
+    def extract_visual_embedded(self, pts_proj, receptive_field, step):
+        # Must preserve spatial ops in FP32
+        with torch.amp.autocast('cuda', enabled=False):
+            pts_proj = pts_proj.float()
+            receptive_field = receptive_field.float()
 
-        B, L, _ = pts_proj.shape  # B x L x 2
-        centers = pts_proj + 0.5 / self.visual_res  # BxLx2
-        centers = centers.reshape(B * L, 2)
+            B, L, _ = pts_proj.shape  # B x L x 2
+            centers = pts_proj + 0.5 / self.visual_res  # BxLx2
+            centers = centers.reshape(B * L, 2)
 
-        theta_trl = (-1 + centers * 2).unsqueeze(-1)  # (BL, 2,1)
+            theta_trl = (-1 + centers * 2).unsqueeze(-1)  # (BL, 2,1)
 
-        theta_s = self.theta_S[step].float().repeat(B * L, 1, 1)  # (BL, 2,2)
-        theta = torch.cat((theta_s, theta_trl), -1)  # (BL, 2,3)
+            theta_s = self.theta_S[step].float().repeat(B * L, 1, 1)  # (BL, 2,2)
+            theta = torch.cat((theta_s, theta_trl), -1)  # (BL, 2,3)
 
-        Bv, C, _, _ = receptive_field.shape
-        assert B == Bv, "Batch mismatch in receptive field!"
+            Bv, C, _, _ = receptive_field.shape
+            assert B == Bv, "Batch mismatch in receptive field!"
 
-        grid = torch.nn.functional.affine_grid(
-            theta,
-            (B * L, C, self.kwindow, self.kwindow),
-            align_corners=False
-        )
+            grid = torch.nn.functional.affine_grid(
+                theta,
+                (B * L, C, self.kwindow, self.kwindow),
+                align_corners=False
+            )
 
-        crops = torch.nn.functional.grid_sample(
-            receptive_field.repeat_interleave(L, dim=0),  # Expand input to BL
-            grid,
-            padding_mode="border",
-            align_corners=False
-        )
+            crops = torch.nn.functional.grid_sample(
+                receptive_field.repeat_interleave(L, dim=0),  # Expand input to BL
+                grid,
+                padding_mode="border",
+                align_corners=False
+            )
 
-        # Now reshape crops back to B x L layout
-        crops = crops.reshape(B, L, C, self.kwindow, self.kwindow)
+            # Now reshape crops back to B x L layout
+            crops = crops.reshape(B, L, C, self.kwindow, self.kwindow)
 
-        visual_ft = self.conv_window[step](
-            crops.view(B * L, C, self.kwindow, self.kwindow)
-        )
+            visual_ft = self.conv_window[step](
+                crops.view(B * L, C, self.kwindow, self.kwindow)
+            )
 
-        Cout = visual_ft.shape[1]
-        visual_ft = visual_ft.view(B, L, Cout)
+            Cout = visual_ft.shape[1]
+            visual_ft = visual_ft.view(B, L, Cout)
 
-    return visual_ft
+        return visual_ft
 
 
     def calculate_distances(self, pts_proj):
