@@ -52,7 +52,7 @@ import torch.multiprocessing as mp
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-# AMP disabled - using float32 throughout for stable gradient computation
+from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import wandb
@@ -306,16 +306,45 @@ class CombinedLoss(nn.Module):
         return total_loss, losses_detail
 
 
+# ======================== Gradient Monitoring ========================
+def check_for_nan_gradients(model: nn.Module, logger: logging.Logger, batch_idx: int, epoch: int) -> bool:
+    """
+    Check for NaN gradients in model parameters.
+    
+    Args:
+        model: Neural network model
+        logger: Logger instance
+        batch_idx: Current batch index
+        epoch: Current epoch number
+    
+    Returns:
+        True if NaN gradients found, False otherwise
+    """
+    nan_found = False
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                #logger.warning(f"⚠️  NaN gradient detected in parameter '{name}' at epoch {epoch}, batch {batch_idx}")
+                nan_found = True
+            if torch.isinf(param.grad).any():
+                #logger.warning(f"⚠️  Inf gradient detected in parameter '{name}' at epoch {epoch}, batch {batch_idx}")
+                nan_found = True
+    
+    return nan_found
+
+
 # ======================== Training Functions ========================
 def train_epoch(model: nn.Module, 
                 dataloader: DataLoader,
                 criterion: nn.Module,
                 optimizer: optim.Optimizer,
+                scaler: GradScaler,
                 device: torch.device,
                 epoch: int,
                 logger: logging.Logger,
                 rank: int,
                 world_size: int,
+                use_amp: bool = True,
                 wandb_log=None) -> Tuple[float, Dict]:
     """
     Train for one epoch with distributed support
@@ -325,11 +354,13 @@ def train_epoch(model: nn.Module,
         dataloader: Training data loader
         criterion: Loss function
         optimizer: Optimizer
+        scaler: Gradient scaler for AMP
         device: Device to train on
         epoch: Current epoch number
         logger: Logger instance
         rank: Current process rank
         world_size: Total number of processes
+        use_amp: Whether to use Automatic Mixed Precision
 
     Returns:
         avg_loss: Average loss over the epoch
@@ -407,15 +438,34 @@ def train_epoch(model: nn.Module,
             if images.shape[1] != 3:
                 images = images.permute(0, 3, 1, 2)
             
-            # Forward pass (float32 throughout - AMP disabled for stable landmark regression)
-            predictions = model([images, model3d, cam_matrix])
-            
-            loss, loss_details = criterion(predictions, targets)
+            optimizer.zero_grad()
 
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Forward pass with mixed precision
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    predictions = model([images, model3d, cam_matrix])
+                    loss, loss_details = criterion(predictions, targets)
+
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients
+                check_for_nan_gradients(model, logger, batch_idx, epoch)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                predictions = model([images, model3d, cam_matrix])
+                loss, loss_details = criterion(predictions, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Check for NaN gradients
+                check_for_nan_gradients(model, logger, batch_idx, epoch)
+                
+                optimizer.step()
 
             # Accumulate losses
             total_loss += loss.item()
@@ -693,6 +743,7 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
     )
     optimizer = optim.Adam(model.parameters(), lr=args.lr_stage1)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage1, gamma=0.1)
+    scaler = torch.amp.GradScaler('cuda')
 
     # Resume from checkpoint if available
     start_epoch = 0
@@ -717,8 +768,8 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, device, 
-            epoch+1, logger, rank, world_size, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, scaler, device,
+            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -799,6 +850,7 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
     )
     optimizer = optim.Adam(model.parameters(), lr=args.lr_stage2)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage2, gamma=0.1)
+    scaler = GradScaler()
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'stage2')
@@ -810,8 +862,8 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, device,
-            epoch+1, logger, rank, world_size, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, scaler, device,
+            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -911,6 +963,7 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
     
     optimizer = optim.Adam(gat_params, lr=args.lr_gat)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_gat, gamma=0.1)
+    scaler = GradScaler()
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'stage3')
@@ -922,8 +975,8 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
         
         # Train
         train_loss, train_details = train_epoch(
-            model, train_loader, criterion, optimizer, device,
-            epoch+1, logger, rank, world_size, wandb_log=wandb_log
+            model, train_loader, criterion, optimizer, scaler, device,
+            epoch+1, logger, rank, world_size, use_amp=args.use_amp, wandb_log=wandb_log
         )
         
         if is_main_process():

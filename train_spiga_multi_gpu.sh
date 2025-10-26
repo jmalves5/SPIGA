@@ -68,6 +68,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -c " singularity exec \
         --dataset wflw \
         --stage all \
         --batch_size 12 \
+        --lr_stage1 5e-4 \
         --use_amp \
         --checkpoint_dir ./checkpoints \
         --log_dir ./logs 

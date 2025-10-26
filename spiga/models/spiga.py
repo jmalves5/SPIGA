@@ -83,7 +83,10 @@ class SPIGA(nn.Module):
 
             # GAT inference
             offset, gat_prob = self.gcn[step](embedded_ft, gat_prob)
-            offset = F.hardtanh(offset)
+
+            with torch.cuda.amp.autocast(enabled=False):
+                offset = offset.float()
+                offset = F.hardtanh(offset)
 
             # Update coordinates
             pts_proj = pts_proj + self.offset_ratio[step] * offset
@@ -127,41 +130,60 @@ class SPIGA(nn.Module):
         embedded_ft = visual_ft + shape_ft
         return embedded_ft
 
-    def extract_visual_embedded(self, pts_proj, receptive_field, step):
-        # Affine matrix generation
-        B, L, _ = pts_proj.shape  # Pts_proj range:[0,1]
+def extract_visual_embedded(self, pts_proj, receptive_field, step):
+    # Must preserve spatial ops in FP32
+    with torch.amp.autocast('cuda', enabled=False):
+        pts_proj = pts_proj.float()
+        receptive_field = receptive_field.float()
+
+        B, L, _ = pts_proj.shape  # B x L x 2
         centers = pts_proj + 0.5 / self.visual_res  # BxLx2
-        centers = centers.reshape(B * L, 2)  # B*Lx2
-        theta_trl = (-1 + centers * 2).unsqueeze(-1)  # BxLx2x1
-        theta_s = self.theta_S[step]  # 2x2
-        theta_s = theta_s.repeat(B * L, 1, 1)  # B*Lx2x2
-        theta = torch.cat((theta_s, theta_trl), -1)  # B*Lx2x3
+        centers = centers.reshape(B * L, 2)
 
-        # Generate crop grid
-        B, C, _, _ = receptive_field.shape
-        grid = torch.nn.functional.affine_grid(theta, (B * L, C, self.kwindow, self.kwindow))
-        grid = grid.reshape(B, L, self.kwindow, self.kwindow, 2)
-        grid = grid.reshape(B, L, self.kwindow * self.kwindow, 2)
+        theta_trl = (-1 + centers * 2).unsqueeze(-1)  # (BL, 2,1)
 
-        # Crop windows
-        crops = torch.nn.functional.grid_sample(receptive_field, grid, padding_mode="border")  # BxCxLxK*K
-        crops = crops.transpose(1, 2)  # BxLxCxK*K
-        crops = crops.reshape(B * L, C, self.kwindow, self.kwindow)
+        theta_s = self.theta_S[step].float().repeat(B * L, 1, 1)  # (BL, 2,2)
+        theta = torch.cat((theta_s, theta_trl), -1)  # (BL, 2,3)
 
-        # Flatten features
-        visual_ft = self.conv_window[step](crops)
-        _, Cout, _, _ = visual_ft.shape
-        visual_ft = visual_ft.reshape(B, L, Cout)
+        Bv, C, _, _ = receptive_field.shape
+        assert B == Bv, "Batch mismatch in receptive field!"
 
-        return visual_ft
+        grid = torch.nn.functional.affine_grid(
+            theta,
+            (B * L, C, self.kwindow, self.kwindow),
+            align_corners=False
+        )
+
+        crops = torch.nn.functional.grid_sample(
+            receptive_field.repeat_interleave(L, dim=0),  # Expand input to BL
+            grid,
+            padding_mode="border",
+            align_corners=False
+        )
+
+        # Now reshape crops back to B x L layout
+        crops = crops.reshape(B, L, C, self.kwindow, self.kwindow)
+
+        visual_ft = self.conv_window[step](
+            crops.view(B * L, C, self.kwindow, self.kwindow)
+        )
+
+        Cout = visual_ft.shape[1]
+        visual_ft = visual_ft.view(B, L, Cout)
+
+    return visual_ft
+
 
     def calculate_distances(self, pts_proj):
-        B, L, _ = pts_proj.shape    # BxLx2
-        pts_a = pts_proj.unsqueeze(-2).repeat(1, 1, L, 1)
-        pts_b = pts_a.transpose(1, 2)
-        dist = pts_a - pts_b
-        dist_wo_self = dist[:, self.diagonal_mask, :].reshape(B, L, -1)
-        return dist_wo_self
+        with torch.cuda.amp.autocast(enabled=False):
+            pts_proj = pts_proj.float()
+            B, L, _ = pts_proj.shape
+            pts_a = pts_proj.unsqueeze(-2)
+            pts_b = pts_a.transpose(1, 2)
+            dist = pts_a - pts_b
+            dist = dist[:, self.diagonal_mask, :].reshape(B, L, -1)
+            return dist
+
 
 
 
