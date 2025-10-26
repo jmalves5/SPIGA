@@ -21,3 +21,10 @@ tmp
 
 # Dataset images
 /spiga/data/databases
+
+/checkpoints
+/logs
+*.out
+/wandb
+*.sif
+.env
