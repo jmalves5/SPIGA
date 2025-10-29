@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # SPIGA Multi-GPU Training Script
-# Distributed training across 4 GPUs using SLURM and Singularity
+# Distributed training across 8 GPUs using SLURM and Singularity
 # 
 # This script uses srun to launch distributed training across multiple GPUs.
 # SLURM automatically sets RANK, WORLD_SIZE, MASTER_ADDR, and MASTER_PORT.
@@ -10,10 +10,10 @@
 #SBATCH --job-name=train_spiga_multigpu
 #SBATCH --partition=prioritized
 #SBATCH --nodelist=a768-l40s-05
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=128G
-#SBATCH --ntasks=4
-#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
+#SBATCH --ntasks=8
+#SBATCH --gres=gpu:8
 #SBATCH --time=72:00:00
 #SBATCH --output=spiga_train.out
 
@@ -28,13 +28,12 @@ cd /home/create.aau.dk/az66ep/UMBRAL/SPIGA
 # ============================================================================
 export WANDB_API_KEY=$WANDB_API_KEY
 export WANDB_PROJECT="train_SPIGA"
-export WANDB_RUN_NAME="train_SPIGA_4GPU"
+export WANDB_RUN_NAME="train_SPIGA_8GPU"
 export WANDB_ENTITY="joaomalves"
-
-
 
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
 export MASTER_PORT=29500
+
 
 # ============================================================================
 # Python and Torch Configuration
@@ -53,7 +52,7 @@ export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-srun --ntasks=4 --ntasks-per-node=4 bash -c " singularity exec \
+srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
     --nv \
     --env TORCH_HOME=$TORCH_HOME \
     --env PYTHONPATH=$PYTHONPATH \
@@ -74,7 +73,7 @@ srun --ntasks=4 --ntasks-per-node=4 bash -c " singularity exec \
     --env PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF \
     spiga_pytorch22.04.sif torchrun \
         --nnodes=1 \
-        --nproc-per-node=4 \
+        --nproc-per-node=8 \
         --rdzv_id=$SLURM_JOB_ID \
         --rdzv_backend=c10d \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
@@ -85,5 +84,4 @@ srun --ntasks=4 --ntasks-per-node=4 bash -c " singularity exec \
         --lr_stage1 1e-3 \
         --checkpoint_dir ./checkpoints \
         --log_dir ./logs \
-
 "
