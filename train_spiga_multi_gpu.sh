@@ -44,7 +44,6 @@ export TORCH_HOME=/home/create.aau.dk/az66ep/UMBRAL/SPIGA/.cache/torch
 # Set NCCL environment variables for multi-node
 export NCCL_DEBUG=WARN
 export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=^docker0,lo
 export NCCL_P2P_LEVEL=NVL
 export NCCL_BUFFSIZE=2097152
 export CUDA_LAUNCH_BLOCKING=0

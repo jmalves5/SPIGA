@@ -22,7 +22,7 @@ tmp
 # Dataset images
 /spiga/data/databases
 
-/checkpoints
+/checkpoints*
 /logs
 *.out
 /wandb
