@@ -59,6 +59,7 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import wandb
 
+MANUAL_SEED = 42
 
 # ======================== Memory Management ========================
 def setup_memory_optimizations():
@@ -68,7 +69,7 @@ def setup_memory_optimizations():
     torch.backends.cudnn.benchmark = True
     
     # Use deterministic algorithms where possible for reproducibility
-    torch.use_deterministic_algorithms(False)  # Set to True if reproducibility needed
+    torch.use_deterministic_algorithms(True)  # Set to True if reproducibility needed
 
 # ======================== Weights & Biases Setup ========================
 def setup_wandb(args, rank: int):
@@ -754,6 +755,7 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
 
 
 def main(rank, args):
+    torch.manual_seed(MANUAL_SEED)
     """Main training function for SLURM-based distributed multi-GPU training.
     
     Rank and world_size are passed as parameters from torchrun launcher.

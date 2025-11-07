@@ -59,6 +59,7 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import wandb
 
+MANUAL_SEED = 42
 
 # ======================== Memory Management ========================
 def setup_memory_optimizations():
@@ -741,6 +742,8 @@ def main(rank, args):
     Rank and world_size are passed as parameters from torchrun launcher.
     For single GPU testing, rank defaults to 0 and world_size to 1.
     """
+
+    torch.manual_seed(MANUAL_SEED)
     
     # Note: rank and world_size are passed as parameters, not extracted here
     # This allows torchrun to properly manage the distributed environment

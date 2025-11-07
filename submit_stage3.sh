@@ -8,7 +8,7 @@
 
 #SBATCH --job-name=spiga_stage3
 #SBATCH --partition=prioritized
-#SBATCH --nodelist=a768-l40s-06
+#SBATCH --nodelist=a768-l40s-05
 #SBATCH --ntasks=8
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
