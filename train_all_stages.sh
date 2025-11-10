@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-#
-# SPIGA Three-Stage Training Pipeline
-# Runs all 3 training stages sequentially using DDP and SLURM
-#
-# Submit with: sbatch train_all_stages.sh
 
 #SBATCH --job-name=spiga_all_stages
 #SBATCH --partition=prioritized
-#SBATCH --ntasks=8
-#SBATCH --nodelist=a768-l40s-06
-#SBATCH --ntasks-per-node=8
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=16
+#SBATCH --ntasks=6
+#SBATCH --nodelist=nv-ai-03
+#SBATCH --ntasks-per-node=6
+#SBATCH --gres=gpu:6
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=256G
 #SBATCH --time=72:00:00
 #SBATCH --output=spiga_all_stages.out
+
+
+export NUM_GPUS=6
 
 # ============================================================================
 # Setup paths and environment
@@ -79,7 +77,7 @@ echo "=========================================="
 
 export WANDB_RUN_NAME="spiga_stage1_${SLURM_JOB_ID}"
 
-srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
+srun --ntasks=$NUM_GPUS --ntasks-per-node=$NUM_GPUS bash -c " singularity exec \
     --nv \
     --env TORCH_HOME=$TORCH_HOME \
     --env PYTHONPATH=$PYTHONPATH \
@@ -100,7 +98,7 @@ srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
     --env PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF \
     spiga_pytorch22.04.sif torchrun \
         --nnodes=1 \
-        --nproc-per-node=8 \
+        --nproc-per-node=$NUM_GPUS \
         --rdzv_id=$SLURM_JOB_ID \
         --rdzv_backend=c10d \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
@@ -127,7 +125,7 @@ echo "=========================================="
 
 export WANDB_RUN_NAME="spiga_stage2_${SLURM_JOB_ID}"
 
-srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
+srun --ntasks=$NUM_GPUS --ntasks-per-node=$NUM_GPUS bash -c " singularity exec \
     --nv \
     --env TORCH_HOME=$TORCH_HOME \
     --env PYTHONPATH=$PYTHONPATH \
@@ -148,7 +146,7 @@ srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
     --env PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF \
     spiga_pytorch22.04.sif torchrun \
         --nnodes=1 \
-        --nproc-per-node=8 \
+        --nproc-per-node=$NUM_GPUS \
         --rdzv_id=$SLURM_JOB_ID \
         --rdzv_backend=c10d \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
@@ -156,7 +154,7 @@ srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
         --dataset "${DATASET}" \
         --epochs_stage2 150 \
         --lr_stage2 1e-3 \
-        --batch_size 12 \
+        --batch_size 8 \
         --checkpoint_dir "${CHECKPOINT_DIR}" \
         --log_dir "${LOG_DIR}" \
         --save_interval 50
@@ -177,7 +175,7 @@ echo "=========================================="
 
 export WANDB_RUN_NAME="spiga_stage3_${SLURM_JOB_ID}"
 
-srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
+srun --ntasks=$NUM_GPUS --ntasks-per-node=$NUM_GPUS bash -c " singularity exec \
     --nv \
     --env TORCH_HOME=$TORCH_HOME \
     --env PYTHONPATH=$PYTHONPATH \
@@ -198,7 +196,7 @@ srun --ntasks=8 --ntasks-per-node=8 bash -c " singularity exec \
     --env PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF \
     spiga_pytorch22.04.sif torchrun \
         --nnodes=1 \
-        --nproc-per-node=8 \
+        --nproc-per-node=$NUM_GPUS \
         --rdzv_id=$SLURM_JOB_ID \
         --rdzv_backend=c10d \
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \

@@ -65,11 +65,17 @@ MANUAL_SEED = 42
 def setup_memory_optimizations():
     """Enable memory-efficient CUDA settings"""
     
+    # Set CUBLAS to allow non-deterministic algorithms (required for CUDA >= 10.2)
+    # This is necessary because some CUDA operations don't support deterministic mode
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    
     # Enable cuDNN benchmark for faster convolutions (with fixed input sizes)
     torch.backends.cudnn.benchmark = True
     
-    # Use deterministic algorithms where possible for reproducibility
-    torch.use_deterministic_algorithms(False)  # Set to True if reproducibility needed
+    # Disable deterministic algorithms due to CUDA 10.2+ compatibility
+    # Using deterministic_algorithms would require all operations to be deterministic,
+    # but CuBLAS operations don't support it with CUDA >= 10.2
+    torch.use_deterministic_algorithms(False)
 
 # ======================== Weights & Biases Setup ========================
 def setup_wandb(args, rank: int):
@@ -812,7 +818,8 @@ def main(rank, args):
         wandb_log.finish()
     
     # Cleanup distributed training
-    cleanup()
+    if world_size > 1:
+        cleanup()
 
 
 if __name__ == "__main__":
@@ -908,3 +915,10 @@ if __name__ == "__main__":
     
     # Call main directly (SLURM + torchrun handles process spawning, NOT mp.spawn)
     main(rank, args)
+    
+    # Ensure proper cleanup even in edge cases
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as e:
+        print(f"Warning: Error during final cleanup: {e}")
