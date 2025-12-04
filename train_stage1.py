@@ -184,7 +184,7 @@ def train_epoch(model: nn.Module,
             
             # Unscale and clip gradients to prevent explosion
             scaler.unscale_(optimizer)
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             # Optimizer step with gradient scaling
             scaler.step(optimizer)
@@ -532,12 +532,12 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
         num_stages=args.num_stages,
         lambda_coord=args.lambda_coord,
         lambda_att=args.lambda_att
-    ).to(device)
+    )
     
-    # Optimizer: optimize CNN backbone + regression heads in criterion
+    # Optimizer: only optimize CNN backbone parameters (visual_cnn)
     # Get the actual model (unwrap DDP if needed)
     actual_model = model.module if hasattr(model, 'module') else model
-    backbone_params = list(actual_model.visual_cnn.parameters()) + list(criterion.stage1_heads.parameters())
+    backbone_params = actual_model.visual_cnn.parameters()
     optimizer = optim.Adam(backbone_params, lr=args.lr_stage1)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage1, gamma=0.1)
     
