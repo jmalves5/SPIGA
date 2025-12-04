@@ -58,7 +58,8 @@ class AWingLoss(nn.Module):
             print(f"  pred stats: min={pred.min():.4f}, max={pred.max():.4f}, mean={pred.mean():.4f}")
             print(f"  target stats: min={target.min():.4f}, max={target.max():.4f}, mean={target.mean():.4f}")
             print(f"  delta stats: min={delta.min():.4f}, max={delta.max():.4f}")
-            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype, requires_grad=True)
+            # Return NaN to signal the training loop to skip this batch
+            return torch.tensor(float('nan'), device=pred.device, dtype=pred.dtype)
 
         return losses.mean()
         
@@ -185,14 +186,14 @@ class LandmarkLoss(nn.Module):
             # Check for NaN/Inf in targets
             if torch.isnan(landmarks_target).any() or torch.isinf(landmarks_target).any():
                 print(f"WARNING: NaN/Inf in landmarks_target before loss computation")
-                return torch.tensor(0.0, device=landmarks_target.device, dtype=landmarks_target.dtype, requires_grad=True), {"landmarks": 0.0, "loss_landmark": 0.0}
+                return torch.tensor(float('nan'), device=landmarks_target.device, dtype=landmarks_target.dtype), {"landmarks": float('nan'), "loss_landmark": float('nan')}
             
             # Aggregate losses across all stages with doubling weights: 1x, 2x, 4x, 8x, ...
             for stage_idx, landmarks_pred in enumerate(landmarks_predictions):
                 # Check for NaN/Inf in predictions
                 if torch.isnan(landmarks_pred).any() or torch.isinf(landmarks_pred).any():
                     print(f"WARNING: NaN/Inf in landmarks_pred at stage {stage_idx}")
-                    return torch.tensor(0.0, device=landmarks_pred.device, dtype=landmarks_pred.dtype, requires_grad=True), {"landmarks": 0.0, "loss_landmark": 0.0}
+                    return torch.tensor(float('nan'), device=landmarks_pred.device, dtype=landmarks_pred.dtype), {"landmarks": float('nan'), "loss_landmark": float('nan')}
                 
                 # Compute coordinate loss for this stage (λc * Lh_coord)
                 coord_loss = self.coord_loss(landmarks_pred, landmarks_target)
@@ -202,7 +203,8 @@ class LandmarkLoss(nn.Module):
                     print(f"WARNING: NaN/Inf in coordinate loss at stage {stage_idx}")
                     print(f"  landmarks_pred stats: min={landmarks_pred.min():.4f}, max={landmarks_pred.max():.4f}")
                     print(f"  landmarks_target stats: min={landmarks_target.min():.4f}, max={landmarks_target.max():.4f}")
-                    return torch.tensor(0.0, device=landmarks_pred.device, dtype=landmarks_pred.dtype, requires_grad=True), {"landmarks": 0.0, "loss_landmark": 0.0}
+                    # Return NaN loss to signal the training loop to skip this batch
+                    return torch.tensor(float('nan'), device=landmarks_pred.device, dtype=landmarks_pred.dtype), {"landmarks": float('nan'), "loss_landmark": float('nan')}
                 
                 stage_loss = self.lambda_coord * coord_loss
                 losses_detail[f"stage_{stage_idx}_coord"] = coord_loss.item()

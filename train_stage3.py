@@ -61,216 +61,15 @@ import wandb
 
 MANUAL_SEED = 42
 
-# ======================== Memory Management ========================
-def setup_memory_optimizations():
-    """Enable memory-efficient CUDA settings"""
-    
-    # Set CUBLAS to allow non-deterministic algorithms (required for CUDA >= 10.2)
-    # This is necessary because some CUDA operations don't support deterministic mode
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    
-    # Enable cuDNN benchmark for faster convolutions (with fixed input sizes)
-    torch.backends.cudnn.benchmark = True
-    
-    # Disable deterministic algorithms due to CUDA 10.2+ compatibility
-    # Using deterministic_algorithms would require all operations to be deterministic,
-    # but CuBLAS operations don't support it with CUDA >= 10.2
-    torch.use_deterministic_algorithms(False)
+from spiga.models.spiga import SPIGA
+from spiga.data.loaders.dl_config import AlignConfig
+from spiga.data.loaders.dataloader import get_dataloader
 
-# ======================== Weights & Biases Setup ========================
-def setup_wandb(args, rank: int):
-    """Initialize wandb logging (only on main process)"""
-    if rank != 0:
-        return None
-    try:
-        wandb_project = os.environ.get('WANDB_PROJECT', 'spiga-training')
-        wandb_entity = os.environ.get('WANDB_ENTITY', None)
-        wandb_run_name = os.environ.get('WANDB_RUN_NAME', f"spiga_{args.dataset}_stage3")
-        
-        # Set mode to offline if no API key is set
-        wandb_mode = "online" if os.environ.get('WANDB_API_KEY') else "offline"
-        print(f"Initializing wandb for rank {rank}")
-        run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            name=wandb_run_name,
-            config=vars(args),
-            tags=[args.dataset, "stage3", f"world_size_{args.world_size}"],
-            mode=wandb_mode,
-            reinit=False,  # Prevent multiple initializations
-            dir="/tmp"  # Use temp directory to avoid conflicts
-        )
-        return run
-    except Exception as e:
-        print(f"Warning: Failed to initialize wandb: {e}")
-        return None
+from utils import setup_memory_optimizations, setup_wandb, setup, cleanup, is_main_process, setup_logging
+from loss import CombinedLoss
 
-# SPIGA imports
-try:
-    from spiga.models.spiga import SPIGA
-    from spiga.data.loaders.dl_config import AlignConfig
-    from spiga.data.loaders.dataloader import get_dataloader
-except ImportError as e:
-    print(f"Error importing SPIGA modules: {e}")
-    print("Please ensure SPIGA is installed: pip install -e .")
-    sys.exit(1)
-
-def setup(rank, world_size):
-    """Initialize distributed training with NCCL backend.
-    
-    For SLURM: RANK and WORLD_SIZE come from srun environment.
-
-    """
-    # Check if already initialized (important for multi-stage training)
-    if dist.is_available() and not dist.is_initialized():
-        # Use environment variables for SLURM compatibility
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size
-        )
-        if rank == 0:
-            print(f"✓ Initialized process group with rank {rank} and world size {world_size}")
-    elif rank == 0:
-        print(f"✓ Process group already initialized (rank {rank}, world_size {world_size})")
-    
-    # Note: Don't call torch.cuda.set_device() here
-    # It's called after device initialization in main()
-    print(f"[DEBUG] Rank {rank}: setup() returning", flush=True)
-
-def cleanup():
-    """Safely destroy distributed process group if initialized."""
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-def is_main_process():
-    """Check if current process is main process (rank 0)"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank() == 0
-    return True
-
-
-def get_rank():
-    """Get current process rank"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank()
-    return 0
-
-
-def get_world_size():
-    """Get total number of processes"""
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size()
-    return 1
-
-
-# ======================== Logging Setup ========================
-def setup_logging(log_dir: str, stage: str, rank: int) -> logging.Logger:
-    """Setup logging configuration (only on main process)"""
-    if not is_main_process():
-        logging.disable(logging.CRITICAL)
-        return logging.getLogger(__name__)
-    
-    os.makedirs(log_dir, exist_ok=True)
-    
-    log_file = os.path.join(
-        log_dir, 
-        f"train_{stage}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_rank{rank}.log"
-    )
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    logger = logging.getLogger(__name__)
-    return logger
-
-
-# ======================== Loss Functions ========================
-class SmoothL1Loss(nn.Module):
-    """Smooth L1 loss for coordinate regression"""
-    def __init__(self, beta: float = 1.0):
-        super(SmoothL1Loss, self).__init__()
-        self.beta = beta
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        diff = torch.abs(pred - target)
-        loss = torch.where(
-            diff < self.beta, 
-            0.5 * diff**2 / self.beta, 
-            diff - 0.5 * self.beta
-        )
-        return loss.mean()
-
-
-class LandmarkLoss(nn.Module):
-    """Combined loss for landmark detection"""
-    def __init__(self, num_stages: int = 4, lambda_coord: float = 4.0, lambda_att: float = 50.0):
-        super(LandmarkLoss, self).__init__()
-        self.num_stages = num_stages
-        self.lambda_coord = lambda_coord
-        self.lambda_att = lambda_att
-        self.coord_loss = SmoothL1Loss()
-
-    def forward(self, predictions: Dict, targets: Dict) -> Tuple[torch.Tensor, Dict]:
-        """Compute landmark loss"""
-        losses_detail = {}
-        
-        # Simple L1 loss on landmarks if available
-        total_loss = None
-        if "Landmarks" in predictions and "landmarks" in targets:
-            # predictions["Landmarks"] is a list of refined landmark predictions
-            landmarks_pred = predictions["Landmarks"][-1]  # Take last refinement
-            landmarks_target = targets["landmarks"]
-            
-            loss = self.coord_loss(landmarks_pred, landmarks_target)
-            total_loss = self.lambda_coord * loss
-            losses_detail["landmarks"] = loss.item()
-        
-        # If no landmarks loss, return zero loss with gradient
-        if total_loss is None:
-            total_loss = torch.tensor(0.0, requires_grad=True)
-        
-        losses_detail["loss_landmark"] = total_loss.item()
-        return total_loss, losses_detail
-
-
-class CombinedLoss(nn.Module):
-    """Combined loss for landmark detection and pose estimation"""
-    def __init__(self, num_stages: int = 4, lambda_coord: float = 4.0, 
-                 lambda_att: float = 50.0, lambda_p: float = 1.0):
-        super(CombinedLoss, self).__init__()
-        self.num_stages = num_stages
-        self.lambda_p = lambda_p
-        self.landmark_loss = LandmarkLoss(num_stages, lambda_coord, lambda_att)
-        self.pose_loss = nn.MSELoss()
-        self.coord_loss = SmoothL1Loss()
-
-    def forward(self, predictions: Dict, targets: Dict) -> Tuple[torch.Tensor, Dict]:
-        """Compute combined landmark and pose loss"""
-        # Landmark loss
-        lnd_loss, lnd_details = self.landmark_loss(predictions, targets)
-        losses_detail = lnd_details.copy()
-
-        # Pose loss (if predictions include pose)
-        pose_loss_total = torch.tensor(0.0, device=lnd_loss.device, dtype=lnd_loss.dtype)
-        
-        if 'Pose' in predictions and 'pose' in targets:
-            pose_pred = predictions['Pose']
-            pose_loss_total = self.lambda_p * self.pose_loss(pose_pred, targets['pose'])
-            losses_detail['pose'] = pose_loss_total.item()
-
-        total_loss = lnd_loss + pose_loss_total
-        losses_detail['loss_pose'] = pose_loss_total.item()
-        losses_detail['loss_total'] = total_loss.item()
-
-        return total_loss, losses_detail
-
+# Import metrics for evaluation
+from spiga.eval.benchmark.metrics.landmarks import MetricsLandmarks
 
 # ======================== Training Functions ========================
 def train_epoch(model: nn.Module, 
@@ -282,6 +81,8 @@ def train_epoch(model: nn.Module,
                 logger: logging.Logger,
                 rank: int,
                 world_size: int,
+                scaler: torch.cuda.amp.GradScaler = None,
+                use_amp: bool = True,
                 wandb_log=None) -> Tuple[float, Dict]:
     """
     Train for one epoch with distributed support
@@ -360,19 +161,62 @@ def train_epoch(model: nn.Module,
             if images.shape[1] != 3:
                 images = images.permute(0, 3, 1, 2)
 
-            # Forward pass
-            predictions = model([images, model3d, cam_matrix])
-            loss, loss_details = criterion(predictions, targets)
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                predictions = model([images, model3d, cam_matrix])
+                loss, loss_details = criterion(predictions, targets)
+
+            # Check for NaN/Inf before backward pass
+            if torch.isnan(loss) or torch.isinf(loss):
+                if is_main_process():
+                    logger.warning(f"NaN/Inf detected in training loss at epoch {epoch}, batch {batch_idx}")
+                    logger.warning(f"Loss value: {loss.item() if not torch.isnan(loss) else 'NaN'}")
+                    logger.warning(f"Skipping batch...")
+                # Clear gradients and continue to next batch
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                continue
 
             # Save loss values before deletion
             loss_val = loss.item()
             loss_details_copy = {k: v for k, v in loss_details.items()}
 
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], max_norm=1.0)
-                        
-            optimizer.step()
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # Unscale gradients
+            scaler.unscale_(optimizer)
+            
+            # Clip gradients
+            #grad_norm = torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], max_norm=1.0)
+            
+            # Check for exploding gradients or NaN in gradients after backward
+            #if grad_norm > 10.0 and is_main_process():
+            #    logger.warning(f"Large gradient norm: {grad_norm:.2f} at epoch {epoch}, batch {batch_idx}")
+            
+            # Check if gradients contain NaN/Inf after clipping
+            has_nan_grad = False
+            for param_group in optimizer.param_groups:
+                for param in param_group['params']:
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        has_nan_grad = True
+                        break
+                if has_nan_grad:
+                    break
+            
+            if has_nan_grad:
+                if is_main_process():
+                    logger.warning(f"NaN/Inf detected in gradients at epoch {epoch}, batch {batch_idx}")
+                    logger.warning(f"Skipping optimizer step...")
+                # Clear gradients and update scaler (must call update after unscale)
+                optimizer.zero_grad()
+                scaler.update()  # Reset scaler state
+                torch.cuda.empty_cache()
+                continue
+            
+            # Optimizer step with gradient scaling
+            scaler.step(optimizer)
+            scaler.update()
             
             # Aggressive memory cleanup
             torch.cuda.empty_cache()
@@ -495,6 +339,12 @@ def validate(model: nn.Module,
                 else:
                     predictions = model(images)
                 loss, loss_details = criterion(predictions, targets)
+
+                # Check for NaN/Inf in validation loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if is_main_process():
+                        logger.warning(f"NaN/Inf detected in validation loss at batch {batch_idx}")
+                    continue
 
                 # Accumulate losses
                 total_loss += loss.item()
@@ -685,14 +535,20 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
         if is_main_process():
             logger.warning(f"Pretrained weights not found: {pretrained_path}")
 
-    # Freeze CNN backbone
+    # Freeze CNN backbone and pose heads
     backbone = model.module.visual_cnn if hasattr(model, 'module') else model.visual_cnn
     backbone.eval()
     for param in backbone.parameters():
         param.requires_grad = False
     
+    # Freeze pose heads
+    pose_fc = model.module.pose_fc if hasattr(model, 'module') else model.pose_fc
+    pose_fc.eval()
+    for param in pose_fc.parameters():
+        param.requires_grad = False
+    
     if is_main_process():
-        logger.info("CNN backbone frozen")
+        logger.info("CNN backbone and pose heads frozen")
         logger.info(f"Model created with {args.num_landmarks} landmarks")
         if world_size > 1:
             logger.info(f"Model wrapped with DistributedDataParallel")
@@ -714,6 +570,14 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
     
     optimizer = optim.Adam(gat_params, lr=args.lr_gat)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_gat, gamma=0.1)
+    
+    # AMP: Mixed precision training with gradient scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    
+    if is_main_process():
+        logger.info(f"✓ Optimizer: Adam with lr={args.lr_gat} (GAT only)")
+        logger.info(f"✓ Scheduler: StepLR (decay at epoch {args.decay_epoch_gat})")
+        logger.info(f"✓ AMP: {'Enabled' if args.use_amp else 'Disabled'}")
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'checkpoint_stage3')
@@ -726,7 +590,8 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
         # Train
         train_loss, train_details = train_epoch(
             model, train_loader, criterion, optimizer, device,
-            epoch+1, logger, rank, world_size, wandb_log=wandb_log
+            epoch+1, logger, rank, world_size, scaler=scaler,
+            use_amp=args.use_amp, wandb_log=wandb_log
         )
         
         if is_main_process():
@@ -755,6 +620,159 @@ def train_stage3(args, logger: logging.Logger, device: torch.device, rank: int, 
 
     if is_main_process():
         logger.info(f"Stage 3 completed! Best validation loss: {best_loss:.6f}")
+        
+        # Log best model to wandb
+        if wandb_log is not None:
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+            artifact = wandb.Artifact(
+                name=f"spiga-stage3-{args.dataset}",
+                type="model",
+                description=f"Best SPIGA Stage 3 model trained on {args.dataset} dataset",
+                metadata={
+                    "dataset": args.dataset,
+                    "stage": 3,
+                    "epochs": args.epochs_stage3,
+                    "best_val_loss": best_loss,
+                    "num_landmarks": args.num_landmarks,
+                    "learning_rate": args.lr_stage3,
+                    "batch_size": args.batch_size,
+                    "world_size": args.world_size
+                }
+            )
+            artifact.add_file(best_model_path)
+            wandb_log.log_artifact(artifact)
+            logger.info(f"Best model logged to wandb: {best_model_path}")
+    
+    # Final test evaluation on test set
+    if is_main_process():
+        logger.info("\n" + "="*80)
+        logger.info("FINAL TEST EVALUATION")
+        logger.info("="*80)
+        
+        # Load best model for testing
+        best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+        if os.path.exists(best_model_path):
+            load_checkpoint(best_model_path, model, device=device, logger=logger)
+            logger.info("Loaded best model for final testing")
+        
+        # Create test dataloader
+        test_cfg = AlignConfig(args.dataset, mode='test')
+        test_loader, _ = get_dataloader(args.batch_size, test_cfg)
+        logger.info(f"Test samples: {len(test_loader.dataset)}")
+        
+        # Run test evaluation
+        test_loss, test_details = validate(
+            model, test_loader, criterion, device, logger, rank, world_size, 
+            epoch=args.epochs_gat, wandb_log=wandb_log
+        )
+        
+        logger.info(f"\nFinal Test Loss:")
+        logger.info(f"  Test Loss: {test_loss:.6f}")
+        for key, val in test_details.items():
+            logger.info(f"  {key}: {val:.6f}")
+        
+        # Calculate landmark metrics (NME, AUC, FR)
+        logger.info("\n" + "="*80)
+        logger.info("CALCULATING TEST METRICS (NME, AUC, FR)")
+        logger.info("="*80)
+        
+        # Collect predictions and annotations
+        model.eval()
+        data_pred = []
+        data_anns = []
+        
+        with torch.no_grad():
+            pbar = tqdm(test_loader, desc="Computing metrics")
+            for batch in pbar:
+                try:
+                    images = batch["image"].to(device, dtype=torch.float32)
+                    if images.dim() == 3:
+                        images = images.unsqueeze(0)
+                    if images.shape[1] != 3:
+                        images = images.permute(0, 3, 1, 2)
+                    
+                    # Get model3d and cam_matrix
+                    model3d = None
+                    cam_matrix = None
+                    if "model3d" in batch:
+                        model3d = batch["model3d"].to(device, dtype=torch.float32)
+                        while model3d.dim() < 3:
+                            model3d = model3d.unsqueeze(0)
+                    if "cam_matrix" in batch:
+                        cam_matrix = batch["cam_matrix"].to(device, dtype=torch.float32)
+                        while cam_matrix.dim() < 3:
+                            cam_matrix = cam_matrix.unsqueeze(0)
+                    
+                    # Forward pass
+                    if model3d is not None and cam_matrix is not None:
+                        predictions = model([images, model3d, cam_matrix])
+                    else:
+                        predictions = model(images)
+                    
+                    # Extract landmarks from predictions
+                    if 'Landmarks' in predictions:
+                        pred_landmarks = predictions['Landmarks'][-1]  # Last refinement
+                    else:
+                        # Fallback: extract from features
+                        continue
+                    
+                    # Process batch
+                    batch_size = pred_landmarks.shape[0]
+                    for b in range(batch_size):
+                        # Predictions
+                        pred_lnd = pred_landmarks[b].cpu().numpy()  # [num_landmarks, 2]
+                        pred_dict = {
+                            'landmarks': pred_lnd,
+                            'ids': list(range(len(pred_lnd)))
+                        }
+                        data_pred.append(pred_dict)
+                        
+                        # Annotations
+                        ann_lnd = batch['landmarks'][b].cpu().numpy()  # [num_landmarks, 2]
+                        ann_dict = {
+                            'landmarks': ann_lnd,
+                            'ids': list(range(len(ann_lnd))),
+                            'bbox': batch.get('bbox', [torch.zeros(4)])[b].cpu().numpy()
+                        }
+                        data_anns.append(ann_dict)
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing batch for metrics: {e}")
+                    continue
+        
+        # Compute metrics
+        if len(data_pred) > 0 and len(data_anns) > 0:
+            try:
+                metrics_calc = MetricsLandmarks()
+                database_info = [args.dataset, 'test']
+                metrics_calc.compute_error(data_anns, data_pred, database_info)
+                metrics_results = metrics_calc.metrics()
+                
+                logger.info("\nTest Metrics:")
+                logger.info(f"  NME: {metrics_results['nme']:.3f}%")
+                logger.info(f"  AUC: {metrics_results['auc']:.3f}%")
+                logger.info(f"  FR@{metrics_results['nme_thr']}: {metrics_results['fr']:.3f}%")
+                
+                # Log metrics to wandb
+                if wandb_log is not None:
+                    metrics_log_dict = {
+                        'test/final_loss': test_loss,
+                        'test/nme': metrics_results['nme'],
+                        'test/auc': metrics_results['auc'],
+                        'test/fr': metrics_results['fr'],
+                    }
+                    for key, val in test_details.items():
+                        metrics_log_dict[f'test/{key}'] = val
+                    wandb_log.log(metrics_log_dict)
+                    logger.info("Test metrics logged to wandb")
+                    
+            except Exception as e:
+                logger.error(f"Error computing metrics: {e}")
+                logger.error("Continuing without detailed metrics...")
+        else:
+            logger.warning("No predictions collected for metrics calculation")
+        
+        logger.info("="*80)
     
     return os.path.join(checkpoint_dir, 'best_model.pth')
 
@@ -787,7 +805,7 @@ def main(rank, args):
         device = torch.device("cpu")
     
     # Setup wandb (main process only)
-    wandb_log = setup_wandb(args, rank) if rank == 0 else None
+    wandb_log = setup_wandb(args, rank, "stage3") if rank == 0 else None
 
     # Setup logging
     logger = setup_logging(args.log_dir, 'stage3', rank)
@@ -816,11 +834,17 @@ def main(rank, args):
         logger.info("="*80)
     
 
-    # Determine pretrained model path
+    # Determine pretrained model path (should load Stage 2 checkpoint for Stage 3 training)
     if args.resume:
         pretrained_path = args.resume
     else:
         pretrained_path = os.path.join(args.checkpoint_dir, 'checkpoint_stage2', 'best_model.pth')
+    
+    # Verify Stage 2 checkpoint exists
+    if not os.path.exists(pretrained_path) and is_main_process():
+        logger.error(f"Stage 2 checkpoint not found at: {pretrained_path}")
+        logger.error("Please train Stage 2 first or provide a checkpoint with --resume")
+        sys.exit(1)
     
     # Run training
     train_stage3(args, logger, device, rank, world_size, pretrained_path, wandb_log=wandb_log)
@@ -895,6 +919,10 @@ if __name__ == "__main__":
                        help="Batch size per GPU (very small for large models)")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of data loading workers")
+    parser.add_argument("--use_amp", action="store_true", default=True,
+                       help="Use Automatic Mixed Precision (AMP) training")
+    parser.add_argument("--no_amp", dest="use_amp", action="store_false",
+                       help="Disable AMP training")
     
     parser.add_argument("--device", type=str, default="cuda",
                        choices=["cuda", "cpu"],

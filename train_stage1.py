@@ -595,7 +595,6 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
         scheduler.step()
 
         # Save best checkpoint (main process only)
-        # only save cnn model, not the regression heads
         if is_main_process():
             if val_loss < best_loss:
                 best_loss = val_loss
@@ -609,6 +608,28 @@ def train_stage1(args, logger: logging.Logger, device: torch.device, rank: int, 
 
     if is_main_process():
         logger.info(f"Stage 1 completed! Best validation loss: {best_loss:.6f}")
+        
+        # Log best model to wandb
+        if wandb_log is not None:
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+            artifact = wandb.Artifact(
+                name=f"spiga-stage1-{args.dataset}",
+                type="model",
+                description=f"Best SPIGA Stage 1 model trained on {args.dataset} dataset",
+                metadata={
+                    "dataset": args.dataset,
+                    "stage": 1,
+                    "epochs": args.epochs_stage1,
+                    "best_val_loss": best_loss,
+                    "num_landmarks": args.num_landmarks,
+                    "learning_rate": args.lr_stage1,
+                    "batch_size": args.batch_size,
+                    "world_size": world_size
+                }
+            )
+            artifact.add_file(best_model_path)
+            wandb_log.log_artifact(artifact)
+            logger.info(f"Best model logged to wandb: {best_model_path}")
     
     return os.path.join(checkpoint_dir, 'best_model.pth')
 
@@ -641,7 +662,7 @@ def main(rank, args):
         device = torch.device("cpu")
     
     # Setup wandb (main process only)
-    wandb_log = setup_wandb(args, rank, "stage1") if rank == 0 else None
+    wandb_log = setup_wandb(args, rank) if rank == 0 else None
 
     # Setup logging
     logger = setup_logging(args.log_dir, 'stage1', rank)

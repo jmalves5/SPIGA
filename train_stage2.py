@@ -59,10 +59,10 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 import wandb
 
-MANUAL_SEED = 42
-
 from utils import setup_memory_optimizations, setup_wandb, setup, cleanup, is_main_process, setup_logging
-from loss import SmoothL1Loss, LandmarkLoss, CombinedLoss
+from loss import CombinedLoss
+
+MANUAL_SEED = 42
 
 from spiga.models.spiga import SPIGA
 from spiga.data.loaders.dl_config import AlignConfig
@@ -80,9 +80,6 @@ def train_epoch(model: nn.Module,
                 logger: logging.Logger,
                 rank: int,
                 world_size: int,
-                scaler: torch.cuda.amp.GradScaler = None,
-                use_amp: bool = True,
-                num_landmarks: int = 98,
                 wandb_log=None) -> Tuple[float, Dict]:
     """
     Train for one epoch with distributed support
@@ -132,12 +129,8 @@ def train_epoch(model: nn.Module,
                 targets["heatmaps_points"] = batch["heatmaps_points"].to(device, dtype=torch.float32)
             if "heatmaps_edges" in batch:
                 targets["heatmaps_edges"] = batch["heatmaps_edges"].to(device, dtype=torch.float32)
-            if "pose" in batch:
-                targets["pose"] = batch["pose"].to(device, dtype=torch.float32)
-                if batch_idx == 0 and is_main_process():
-                    logger.info(f"[DEBUG] Pose found in batch, shape: {targets['pose'].shape}")
-            elif batch_idx == 0 and is_main_process():
-                logger.warning(f"[DEBUG] No pose in batch! Available keys: {batch.keys()}")
+            if "headpose" in batch:
+                targets["pose"] = batch["headpose"].to(device, dtype=torch.float32)
 
             # Delete batch from memory after moving to device
             torch.cuda.empty_cache()
@@ -165,60 +158,19 @@ def train_epoch(model: nn.Module,
             if images.shape[1] != 3:
                 images = images.permute(0, 3, 1, 2)
 
-            # Forward pass with AMP - Stage 2: CNN + Pose (with regression heads, like Stage 1)
-            # Call visual_cnn directly + pose_fc, use regression heads for landmarks
-            actual_model = model.module if hasattr(model, 'module') else model
-            
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                # Direct CNN forward - returns {'VisualField': [...], 'HGcore': [...]}
-                cnn_predictions = actual_model.visual_cnn(images)
-                
-                # Add pose prediction (extract from last HGcore, same as backbone_forward)
-                pose_raw = cnn_predictions['HGcore'][-1]  # Last hourglass core features
-                B, L, _, _ = pose_raw.shape
-                pose_flat = pose_raw.reshape(B, L)  # Flatten spatial dimensions
-                pose = actual_model.pose_fc(pose_flat)
-                cnn_predictions['Pose'] = pose
-                
-                # Compute loss: landmarks (regression heads) + pose
-                loss, loss_details = criterion(cnn_predictions, targets)
-                
-                # Debug logging for first batch
-                if batch_idx == 0 and is_main_process():
-                    logger.info(f"[DEBUG] Pose in predictions: {'Pose' in cnn_predictions}")
-                    logger.info(f"[DEBUG] Pose in targets: {'pose' in targets}")
-                    if 'Pose' in cnn_predictions:
-                        logger.info(f"[DEBUG] Pose pred shape: {cnn_predictions['Pose'].shape}")
-                    if 'pose' in targets:
-                        logger.info(f"[DEBUG] Pose target shape: {targets['pose'].shape}")
-                    logger.info(f"[DEBUG] Loss details: {loss_details}")
-
-            # Check for NaN/Inf before backward pass
-            if torch.isnan(loss) or torch.isinf(loss):
-                if is_main_process():
-                    logger.error(f"NaN/Inf detected in training loss at epoch {epoch}, batch {batch_idx}")
-                    logger.error(f"Loss value: {loss.item()}")
-                    logger.error(f"Skipping batch...")
-                continue
+            # Forward pass
+            predictions = model([images, model3d, cam_matrix])
+            loss, loss_details = criterion(predictions, targets)
 
             # Save loss values before deletion
             loss_val = loss.item()
             loss_details_copy = {k: v for k, v in loss_details.items()}
 
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
-            
-            # Unscale and clip gradients
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Check for exploding gradients
-            if grad_norm > 10.0 and is_main_process():
-                logger.warning(f"Large gradient norm: {grad_norm:.2f} at epoch {epoch}, batch {batch_idx}")
-            
-            # Optimizer step with gradient scaling
-            scaler.step(optimizer)
-            scaler.update()
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        
+            optimizer.step()
             
             # Aggressive memory cleanup
             torch.cuda.empty_cache()
@@ -284,8 +236,6 @@ def validate(model: nn.Module,
              rank: int,
              world_size: int,
              epoch: int = 0,
-             use_amp: bool = True,
-             num_landmarks: int = 98,
              wandb_log=None) -> Tuple[float, Dict]:
     """
     Validate the model with distributed support
@@ -337,28 +287,12 @@ def validate(model: nn.Module,
                 if images.shape[1] != 3:
                     images = images.permute(0, 3, 1, 2)
 
-                # Forward pass with AMP - Stage 2: CNN + Pose (with regression heads)
-                actual_model = model.module if hasattr(model, 'module') else model
-                
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    # Direct CNN forward
-                    cnn_predictions = actual_model.visual_cnn(images)
-                    
-                    # Add pose prediction (extract from last HGcore)
-                    if model3d is not None and cam_matrix is not None:
-                        pose_raw = cnn_predictions['HGcore'][-1]
-                        B, L, _, _ = pose_raw.shape
-                        pose_flat = pose_raw.reshape(B, L)
-                        pose = actual_model.pose_fc(pose_flat)
-                        cnn_predictions['Pose'] = pose
-                    
-                    loss, loss_details = criterion(cnn_predictions, targets)
-                
-                # Check for NaN/Inf
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if is_main_process():
-                        logger.error(f"NaN/Inf in validation loss at batch {num_batches}")
-                    continue
+                # Forward pass
+                if model3d is not None and cam_matrix is not None:
+                    predictions = model([images, model3d, cam_matrix])
+                else:
+                    predictions = model(images)
+                loss, loss_details = criterion(predictions, targets)
 
                 # Accumulate losses
                 total_loss += loss.item()
@@ -498,27 +432,14 @@ def load_checkpoint(checkpoint_path: str,
 
 
 def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, world_size: int, pretrained_path: str, wandb_log=None):
-    """Stage 2: Fine-tuning CNN backbone + Pose (Freeze GAT regressors)
-    
-    Paper: "Once the model has been pre-trained with landmarks, it is fine-tuned 
-    with both tasks, pose and landmarks. Sharing the same hyperparameter configuration 
-    as in the previous pretraining stage during 150 epochs, with a step decay from 
-    10^-3 to 10^-4 at epoch 100."
-    
-    Training: Same as Stage 1 (CNN + regression heads) + Pose estimation
-    - visual_cnn (CNN backbone)
-    - pose_fc (pose estimation head)
-    - Use regression heads for landmark prediction (no GAT)
-    
-    Frozen: GAT regressors (gcn, shape_encoder, conv_window) - not used in Stage 2
-    """
+    """Stage 2: Fine-tuning with both landmark detection and pose estimation"""
     if is_main_process():
         logger.info("\n" + "="*80)
-        logger.info("STAGE 2: CNN + Pose Fine-tuning (Regression Heads for Landmarks)")
+        logger.info("STAGE 2: Fine-tuning (Landmarks + Pose)")
         logger.info("="*80)
         logger.info(f"Epochs: {args.epochs_stage2}")
-        logger.info(f"Learning Rate: {args.lr_stage2} (decay to {args.lr_stage2 * 0.1} at epoch {args.decay_epoch_stage2})")
-        logger.info(f"Pretrained CNN weights: {pretrained_path}")
+        logger.info(f"Learning Rate: {args.lr_stage2}")
+        logger.info(f"Pretrained weights: {pretrained_path}")
 
     # Data loading
     logger.info(f"Loading {args.dataset} dataset...")
@@ -539,44 +460,11 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
         logger.info(f"Train samples: {len(train_loader.dataset)}")
         logger.info(f"Val samples: {len(val_loader.dataset)}")
 
-    # Create SPIGA model
+    # Model with pre-trained weights
     model = SPIGA(
         num_landmarks=args.num_landmarks,
         num_edges=args.num_edges
     ).to(device)
-    
-    # Load Stage 1 pretrained CNN weights (best_model.pth from checkpoint_stage1)
-    if os.path.exists(pretrained_path):
-        if is_main_process():
-            logger.info(f"Loading Stage 1 pretrained CNN weights from: {pretrained_path}")
-        load_checkpoint(pretrained_path, model, device=device, logger=logger)
-    else:
-        if is_main_process():
-            logger.warning(f"Pretrained Stage 1 weights not found: {pretrained_path}")
-    
-    # STAGE 2: Freeze GAT components, train CNN + Pose
-    # Freeze: gcn, shape_encoder, conv_window (GAT regressors for Stage 3)
-    # Train: visual_cnn (CNN backbone) + pose_fc (pose estimation)
-    for param in model.gcn.parameters():
-        param.requires_grad = False
-    for param in model.shape_encoder.parameters():
-        param.requires_grad = False
-    for param in model.conv_window.parameters():
-        param.requires_grad = False
-    
-    # Ensure CNN and pose_fc are trainable
-    for param in model.visual_cnn.parameters():
-        param.requires_grad = True
-    for param in model.pose_fc.parameters():
-        param.requires_grad = True
-    
-    if is_main_process():
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"✓ SPIGA model created with {args.num_landmarks} landmarks")
-        logger.info(f"✓ GAT components FROZEN (not used in Stage 2)")
-        logger.info(f"✓ Training CNN + Pose (visual_cnn, pose_fc) with regression heads")
-        logger.info(f"✓ Trainable: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
     
     # Wrap with DistributedDataParallel
     if world_size > 1:
@@ -584,39 +472,29 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
             model,
             device_ids=[rank],
             output_device=rank,
-            find_unused_parameters=True  # GAT params are frozen
+            find_unused_parameters=True
         )
+    
+    if os.path.exists(pretrained_path):
+        load_checkpoint(pretrained_path, model, device=device, logger=logger)
+    else:
         if is_main_process():
-            logger.info(f"✓ Model wrapped with DistributedDataParallel")
+            logger.warning(f"Pretrained weights not found: {pretrained_path}")
 
-    # Loss: Combined landmark (with regression heads) + pose loss (Paper Equation 2)
-    # Same as Stage 1 but with added pose loss
-    from loss import CombinedLoss
+    if is_main_process():
+        logger.info(f"Model created with {args.num_landmarks} landmarks")
+        if world_size > 1:
+            logger.info(f"Model wrapped with DistributedDataParallel")
+
+    # Loss, optimizer, scheduler
     criterion = CombinedLoss(
         num_stages=args.num_stages,
         lambda_coord=args.lambda_coord,
         lambda_att=args.lambda_att,
-        lambda_p=args.lambda_p  # Paper: λ_p = 1.0
-    ).to(device)
-    
-    # Optimizer: CNN + pose_fc + regression heads
-    actual_model = model.module if hasattr(model, 'module') else model
-    trainable_params_list = (
-        list(actual_model.visual_cnn.parameters()) + 
-        list(actual_model.pose_fc.parameters()) +
-        list(criterion.landmark_loss.stage1_heads.parameters())  # Regression heads from loss
+        lambda_p=args.lambda_p
     )
-    optimizer = optim.Adam(trainable_params_list, lr=args.lr_stage2)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr_stage2)
     scheduler = StepLR(optimizer, step_size=args.decay_epoch_stage2, gamma=0.1)
-    
-    # AMP: Mixed precision training
-    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
-    
-    if is_main_process():
-        logger.info(f"✓ Optimizer: Adam with lr={args.lr_stage2} (CNN + Pose + Regression Heads)")
-        logger.info(f"✓ Scheduler: StepLR (decay 0.1 at epoch {args.decay_epoch_stage2})")
-        logger.info(f"✓ Loss: Landmark (regression heads) + Pose, λ_p={args.lambda_p}")
-        logger.info(f"✓ AMP: {'Enabled' if args.use_amp else 'Disabled'}")
 
     best_loss = float('inf')
     checkpoint_dir = os.path.join(args.checkpoint_dir, 'checkpoint_stage2')
@@ -629,23 +507,14 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
         # Train
         train_loss, train_details = train_epoch(
             model, train_loader, criterion, optimizer, device,
-            epoch+1, logger, rank, world_size, scaler=scaler,
-            use_amp=args.use_amp, num_landmarks=args.num_landmarks,
-            wandb_log=wandb_log
+            epoch+1, logger, rank, world_size, wandb_log=wandb_log
         )
         
         if is_main_process():
             logger.info(f"Train Loss: {train_loss:.6f}")
-            if 'loss_pose' in train_details:
-                logger.info(f"  - Landmark Loss: {train_details.get('loss_landmark', 0):.6f}")
-                logger.info(f"  - Pose Loss: {train_details.get('loss_pose', 0):.6f}")
 
         # Validate
-        val_loss, val_details = validate(
-            model, val_loader, criterion, device, logger, rank, world_size,
-            epoch=epoch+1, use_amp=args.use_amp, num_landmarks=args.num_landmarks,
-            wandb_log=wandb_log
-        )
+        val_loss, val_details = validate(model, val_loader, criterion, device, logger, rank, world_size, epoch=epoch+1, wandb_log=wandb_log)
         
         if is_main_process():
             logger.info(f"Val Loss: {val_loss:.6f}")
@@ -667,6 +536,28 @@ def train_stage2(args, logger: logging.Logger, device: torch.device, rank: int, 
 
     if is_main_process():
         logger.info(f"Stage 2 completed! Best validation loss: {best_loss:.6f}")
+        
+        # Log best model to wandb
+        if wandb_log is not None:
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pth')
+            artifact = wandb.Artifact(
+                name=f"spiga-stage2-{args.dataset}",
+                type="model",
+                description=f"Best SPIGA Stage 2 model trained on {args.dataset} dataset",
+                metadata={
+                    "dataset": args.dataset,
+                    "stage": 2,
+                    "epochs": args.epochs_stage2,
+                    "best_val_loss": best_loss,
+                    "num_landmarks": args.num_landmarks,
+                    "learning_rate": args.lr_stage2,
+                    "batch_size": args.batch_size,
+                    "world_size": args.world_size
+                }
+            )
+            artifact.add_file(best_model_path)
+            wandb_log.log_artifact(artifact)
+            logger.info(f"Best model logged to wandb: {best_model_path}")
     
     return os.path.join(checkpoint_dir, 'best_model.pth')
 
@@ -801,14 +692,10 @@ if __name__ == "__main__":
                        help="Weight for pose loss")
 
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=24,
-                       help="Batch size (paper uses 24 total)")
+    parser.add_argument("--batch_size", type=int, default=12,
+                       help="Batch size per GPU (very small for large models)")
     parser.add_argument("--num_workers", type=int, default=4,
                        help="Number of data loading workers")
-    parser.add_argument("--use_amp", action="store_true", default=True,
-                       help="Use Automatic Mixed Precision (AMP) training")
-    parser.add_argument("--no_amp", dest="use_amp", action="store_false",
-                       help="Disable AMP training")
     
     parser.add_argument("--device", type=str, default="cuda",
                        choices=["cuda", "cpu"],
